@@ -1,0 +1,1085 @@
+"""SQLite persistence for Oracle Agent Server (protocol v1).
+
+Thread-safety note: sqlite3 connections are created per call and all writes are
+serialized with a module-level lock. Good enough for the v1 single-process
+server; swap to another store later without touching the API layer.
+"""
+import hashlib
+import hmac
+import json
+import secrets
+import sqlite3
+import threading
+import uuid
+from datetime import datetime, timedelta, timezone
+
+from .config import ASSIGNED_EXPIRY_SEC, DB_PATH
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS agents (
+  agent_id     TEXT PRIMARY KEY,
+  name         TEXT,
+  token_hash   TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'offline',
+  version      TEXT,
+  capabilities TEXT DEFAULT '[]',
+  meta         TEXT DEFAULT '{}',
+  last_seen    TEXT,
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+  task_id     TEXT PRIMARY KEY,
+  agent_id    TEXT NOT NULL,
+  type        TEXT NOT NULL,
+  params      TEXT DEFAULT '{}',
+  status      TEXT NOT NULL DEFAULT 'pending',
+  timeout_sec INTEGER NOT NULL DEFAULT 60,
+  attempts    INTEGER NOT NULL DEFAULT 1,
+  created_at  TEXT NOT NULL,
+  started_at  TEXT,
+  finished_at TEXT,
+  result      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_agent_status ON tasks(agent_id, status);
+
+CREATE TABLE IF NOT EXISTS runs (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id           INTEGER,
+  status           TEXT DEFAULT 'queued',          -- oracle 归一化状态
+  github_status    TEXT DEFAULT 'queued',
+  github_conclusion TEXT,
+  agent_id         TEXT,
+  public_ip        TEXT,
+  private_ip       TEXT,
+  vm_id            TEXT,
+  vm_name          TEXT,
+  vm_size          TEXT,
+  location         TEXT,
+  triggered_at     TEXT,
+  registered_at    TEXT,
+  updated_at       TEXT,
+  template         TEXT,
+  origin           TEXT,
+  meta_json        TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_run_id ON runs(run_id);
+
+CREATE TABLE IF NOT EXISTS task_templates (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  name        TEXT UNIQUE,
+  description TEXT,
+  steps       TEXT,
+  enabled     INTEGER DEFAULT 1,
+  created_at  TEXT,
+  updated_at  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS template_secrets (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  template_id INTEGER REFERENCES task_templates(id),
+  key         TEXT,
+  value       TEXT,
+  UNIQUE(template_id, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_template_secrets_template ON template_secrets(template_id);
+
+CREATE TABLE IF NOT EXISTS template_runs (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id      INTEGER,
+  template    TEXT,
+  agent_id    TEXT,
+  status      TEXT DEFAULT 'running',
+  failed_step TEXT DEFAULT '',
+  steps_json  TEXT DEFAULT '[]',
+  created_at  TEXT,
+  finished_at TEXT
+);
+"""
+
+FINAL_STATUSES = ("success", "failed", "timeout", "rejected")
+
+_lock = threading.Lock()
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _conn() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with _lock:
+        conn = _conn()
+        try:
+            conn.executescript(SCHEMA)
+            # 迁移：老库 runs 表缺生命周期列时补齐
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+            for col, ddl in (
+                ("status", "TEXT DEFAULT 'queued'"),
+                ("github_status", "TEXT DEFAULT 'queued'"),
+                ("github_conclusion", "TEXT"),
+                ("triggered_at", "TEXT"),
+                ("template", "TEXT"),
+                ("origin", "TEXT"),
+            ):
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {ddl}")
+            # 老行回填：没有生命周期语义的行视为已注册 running
+            conn.execute(
+                "UPDATE runs SET status='running', github_status='in_progress' "
+                "WHERE status NOT IN ('queued','provisioning','running','completed','failed','cancelled','provisioning_timeout')"
+            )
+            conn.commit()
+        finally:
+            # ── schema migrations (idempotent) ──
+            for col_sql in [
+                "ALTER TABLE runs ADD COLUMN cancel_intent INTEGER DEFAULT 0",
+            ]:
+                try:
+                    conn.execute(col_sql)
+                except Exception:
+                    pass  # column already exists
+            conn.commit()
+            conn.close()
+
+
+# ---------------------------------------------------------------- agents
+
+def get_agent(agent_id: str):
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "SELECT * FROM agents WHERE agent_id=?", (agent_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+    return dict(row) if row else None
+
+
+def get_token_hash(agent_id: str):
+    agent = get_agent(agent_id)
+    return agent["token_hash"] if agent else None
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def verify_token(agent_id: str, token: str) -> bool:
+    if not token:
+        return False
+    expected = get_token_hash(agent_id)
+    if not expected:
+        return False
+    return hmac.compare_digest(expected, hash_token(token))
+
+
+def register_agent(agent_id: str, name, version, capabilities, meta) -> dict:
+    """Create a new agent (returns a fresh token) or re-register an existing
+    one (returns token=None — the agent keeps its local token)."""
+    now = _now()
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "SELECT token_hash, created_at FROM agents WHERE agent_id=?",
+                (agent_id,),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "UPDATE agents SET name=?, version=?, capabilities=?, meta=?, updated_at=? WHERE agent_id=?",
+                    (
+                        name or agent_id,
+                        version,
+                        json.dumps(capabilities or []),
+                        json.dumps(meta or {}),
+                        now,
+                        agent_id,
+                    ),
+                )
+                conn.commit()
+                return {
+                    "agent_id": agent_id,
+                    "token": None,  # re-register: keep existing local token
+                    "created_at": row["created_at"],
+                }
+            token = secrets.token_urlsafe(32)
+            conn.execute(
+                "INSERT INTO agents (agent_id, name, token_hash, status, version, capabilities, meta, last_seen, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    agent_id,
+                    name or agent_id,
+                    hash_token(token),
+                    "online",
+                    version,
+                    json.dumps(capabilities or []),
+                    json.dumps(meta or {}),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+            return {"agent_id": agent_id, "token": token, "created_at": now}
+        finally:
+            conn.close()
+
+
+def heartbeat(agent_id: str, status: str, version, capabilities, load) -> bool:
+    now = _now()
+    with _lock:
+        conn = _conn()
+        try:
+            if capabilities is not None:
+                cur = conn.execute(
+                    "UPDATE agents SET status=?, version=?, capabilities=?, last_seen=?, updated_at=? WHERE agent_id=?",
+                    (status, version, json.dumps(capabilities), now, now, agent_id),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE agents SET status=?, version=?, last_seen=?, updated_at=? WHERE agent_id=?",
+                    (status, version, now, now, agent_id),
+                )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def list_agents() -> list:
+    with _lock:
+        conn = _conn()
+        try:
+            rows = conn.execute("SELECT * FROM agents ORDER BY created_at").fetchall()
+        finally:
+            conn.close()
+    agents = []
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=180)
+    ).isoformat()
+    for row in rows:
+        a = dict(row)
+        a["capabilities"] = json.loads(a["capabilities"] or "[]")
+        a["meta"] = json.loads(a["meta"] or "{}")
+        a["token_hash"] = a["token_hash"][:8] + "…"  # never expose full hash
+        a["online"] = bool(a["last_seen"]) and a["last_seen"] >= cutoff
+        agents.append(a)
+    return agents
+
+
+# ----------------------------------------------------------------- tasks
+
+def create_task(agent_id: str, type_: str, params: dict, timeout_sec: int = 60) -> dict:
+    now = _now()
+    task_id = uuid.uuid4().hex
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute(
+                "INSERT INTO tasks (task_id, agent_id, type, params, status, timeout_sec, attempts, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    task_id,
+                    agent_id,
+                    type_,
+                    json.dumps(params or {}),
+                    "pending",
+                    timeout_sec,
+                    1,
+                    now,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return {
+        "task_id": task_id,
+        "agent_id": agent_id,
+        "type": type_,
+        "params": params or {},
+        "status": "pending",
+        "timeout_sec": timeout_sec,
+        "created_at": now,
+    }
+
+
+def claim_next_pending(agent_id: str):
+    """Atomically take the oldest pending task for an agent (pending -> assigned)."""
+    now = _now()
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE agent_id=? AND status='pending' "
+                "ORDER BY created_at ASC LIMIT 1",
+                (agent_id,),
+            ).fetchone()
+            if not row:
+                conn.rollback()
+                return None
+            conn.execute(
+                "UPDATE tasks SET status='assigned', started_at=? WHERE task_id=?",
+                (now, row["task_id"]),
+            )
+            conn.commit()
+            t = dict(row)
+            t["params"] = json.loads(t["params"] or "{}")
+            t["status"] = "assigned"
+            t["started_at"] = now
+            return t
+        finally:
+            conn.close()
+
+
+def complete_task(agent_id: str, task_id: str, status: str, output, error,
+                  started_at, finished_at) -> dict:
+    finished_at = finished_at or _now()
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE task_id=? AND agent_id=?",
+                (task_id, agent_id),
+            ).fetchone()
+            if not row:
+                conn.rollback()
+                return {"ok": False, "reason": "not_found"}
+            if row["status"] in FINAL_STATUSES and row["status"] != status:
+                conn.rollback()
+                return {"ok": False, "reason": "conflict"}
+            result = {
+                "output": output,
+                "error": error,
+                "started_at": started_at,
+                "finished_at": finished_at,
+            }
+            if row["status"] not in FINAL_STATUSES:
+                conn.execute(
+                    "UPDATE tasks SET status=?, finished_at=?, result=? WHERE task_id=?",
+                    (status, finished_at, json.dumps(result), task_id),
+                )
+            conn.commit()
+            return {"ok": True}
+        finally:
+            conn.close()
+
+
+def reset_stale_assigned() -> int:
+    """Assigned-but-untouched tasks become pending again (lease expiry)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=ASSIGNED_EXPIRY_SEC)).isoformat()
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                "UPDATE tasks SET status='pending', attempts=attempts+1, started_at=NULL "
+                "WHERE status='assigned' AND started_at < ?",
+                (cutoff,),
+            )
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+
+def list_tasks(agent_id: str | None = None, status: str | None = None) -> list:
+    sql = "SELECT * FROM tasks"
+    cond, args = [], []
+    if agent_id:
+        cond.append("agent_id=?")
+        args.append(agent_id)
+    if status:
+        cond.append("status=?")
+        args.append(status)
+    if cond:
+        sql += " WHERE " + " AND ".join(cond)
+    sql += " ORDER BY created_at DESC LIMIT 200"
+    with _lock:
+        conn = _conn()
+        try:
+            rows = conn.execute(sql, args).fetchall()
+        finally:
+            conn.close()
+    tasks = []
+    for row in rows:
+        t = dict(row)
+        t["params"] = json.loads(t["params"] or "{}")
+        t["result"] = json.loads(t["result"]) if t["result"] else None
+        tasks.append(t)
+    return tasks
+
+
+def get_task(task_id: str):
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+    if not row:
+        return None
+    t = dict(row)
+    t["params"] = json.loads(t["params"] or "{}")
+    t["result"] = json.loads(t["result"]) if t["result"] else None
+    return t
+
+def update_agent_meta(agent_id: str, meta: dict) -> None:
+    now = _now()
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute(
+                "UPDATE agents SET meta=?, updated_at=? WHERE agent_id=?",
+                (json.dumps(meta), now, agent_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+# ----------------------------------------------------------------- runs
+
+# Oracle 归一化状态
+RUN_ORACLE_QUEUED = "queued"
+RUN_ORACLE_PROVISIONING = "provisioning"
+RUN_ORACLE_RUNNING = "running"
+RUN_ORACLE_COMPLETED = "completed"
+RUN_ORACLE_FAILED = "failed"
+RUN_ORACLE_CANCELLED = "cancelled"
+RUN_ORACLE_PROVISIONING_TIMEOUT = "provisioning_timeout"
+
+RUN_TERMINAL = {RUN_ORACLE_COMPLETED, RUN_ORACLE_FAILED, RUN_ORACLE_CANCELLED, RUN_ORACLE_PROVISIONING_TIMEOUT}
+
+
+def oracle_status_from_github(github_status: str, github_conclusion: str | None, agent_id: str | None) -> str:
+    """GitHub 双层语义 → Oracle 归一化状态。"""
+    if github_status == "queued":
+        return RUN_ORACLE_QUEUED
+    if github_status == "in_progress":
+        return RUN_ORACLE_RUNNING if agent_id else RUN_ORACLE_PROVISIONING
+    if github_status == "completed":
+        c = (github_conclusion or "").lower()
+        if c == "success":
+            return RUN_ORACLE_COMPLETED
+        if c == "failure":
+            return RUN_ORACLE_FAILED
+        if c == "cancelled":
+            return RUN_ORACLE_CANCELLED
+        return RUN_ORACLE_COMPLETED  # 其它结论保留 github_conclusion 原文
+    return RUN_ORACLE_QUEUED  # unknown/其它 -> 保守归 queued
+
+
+def create_run_provisioning(run_id: int, now: str, github_status: str = "queued", github_conclusion: str | None = None, template: str | None = None, origin: str = "manual") -> dict:
+    """trigger 成功即建档（幂等：已存在则仅更新 github 层）。"""
+    status = oracle_status_from_github(github_status, github_conclusion, None)
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT id FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if row:
+                conn.execute(
+                    "UPDATE runs SET status=?, github_status=?, github_conclusion=?, updated_at=?, triggered_at=COALESCE(triggered_at, ?), template=COALESCE(template, ?), origin=COALESCE(origin, ?) WHERE run_id=?",
+                    (status, github_status, github_conclusion, now, now, template, origin, run_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO runs (run_id, status, github_status, github_conclusion, triggered_at, updated_at, template, origin) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (run_id, status, github_status, github_conclusion, now, now, template, origin),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    return get_run(run_id) or {}
+
+
+def sync_run_from_github(run_id: int, github_status: str, github_conclusion: str | None, now: str) -> str | None:
+    """GitHub 状态同步（queued→provisioning→running；completed→completed/failed/cancelled）。"""
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if not row:
+                conn.rollback()
+                return None
+            agent_id = row["agent_id"]
+            new_status = oracle_status_from_github(github_status, github_conclusion, agent_id)
+            conn.execute(
+                "UPDATE runs SET status=?, github_status=?, github_conclusion=?, updated_at=? WHERE run_id=?",
+                (new_status, github_status, github_conclusion, now, run_id),
+            )
+            conn.commit()
+            return new_status
+        finally:
+            conn.close()
+
+
+def mark_run_agent_registered(run_id: int, meta: dict, agent_id: str, now: str) -> None:
+    """Agent 注册成功：填实例信息并把 running 置位（不覆盖终态）。"""
+    imds = meta.get("imds") or {}
+    compute = imds.get("compute") or {}
+    network = imds.get("network") or {}
+    private_ip = ""
+    for iface in network.get("interface") or []:
+        for a in iface.get("ipv4", {}).get("ipAddress") or []:
+            if a.get("privateIpAddress"):
+                private_ip = a["privateIpAddress"]
+                break
+        if private_ip:
+            break
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if row and row["status"] in RUN_TERMINAL:
+                # 终态不倒退；仅补实例信息
+                conn.execute(
+                    "UPDATE runs SET agent_id=?, public_ip=?, private_ip=?, vm_id=?, vm_name=?, vm_size=?, location=?, meta_json=?, updated_at=? WHERE run_id=?",
+                    (agent_id, (meta.get("public_ip") or "").strip(), private_ip,
+                     compute.get("vmId") or "", compute.get("name") or "",
+                     compute.get("vmSize") or "", compute.get("location") or "",
+                     json.dumps(meta or {}, ensure_ascii=False), now, run_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE runs SET status=?, github_status=COALESCE(github_status,'in_progress'), agent_id=?, public_ip=?, private_ip=?, "
+                    "vm_id=?, vm_name=?, vm_size=?, location=?, registered_at=?, meta_json=?, updated_at=? WHERE run_id=?",
+                    (RUN_ORACLE_RUNNING, agent_id, (meta.get("public_ip") or "").strip(), private_ip,
+                     compute.get("vmId") or "", compute.get("name") or "",
+                     compute.get("vmSize") or "", compute.get("location") or "",
+                     (row["registered_at"] if row and row["registered_at"] else now),  # 首次注册回填 now
+                     json.dumps(meta or {}, ensure_ascii=False), now, run_id),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def verify_registered_run_agent(run_id: int, meta: dict, agent_id: str, now: str) -> dict:
+    """register 时调用：行存在 → mark_run_agent_registered；行不存在（UI 直触发的 run）
+    直接建档为 running。"""
+    up = get_run(run_id)
+    if up:
+        mark_run_agent_registered(run_id, meta, agent_id, now)
+    else:
+        with _lock:
+            conn = _conn()
+            try:
+                conn.execute(
+                    "INSERT INTO runs (run_id, status, github_status, agent_id, registered_at, updated_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (run_id, RUN_ORACLE_RUNNING, "in_progress", agent_id, now, now),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        mark_run_agent_registered(run_id, meta, agent_id, now)
+    return get_run(run_id) or {}
+
+
+def expire_provisioning(minutes: int = 5) -> int:
+    """provisioning 超时 → provisioning_timeout（惰性/定时调用）。"""
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                "UPDATE runs SET status=?, updated_at=? WHERE status=? AND updated_at < ?",
+                (RUN_ORACLE_PROVISIONING_TIMEOUT, _now(), RUN_ORACLE_PROVISIONING, cutoff),
+            )
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+
+def reap_stale_runs(max_age_hours: float = 6.5) -> int:
+    """兜底回收：把超过 GitHub 单 run 硬上限仍未进入终态的 run 强制标终态。
+
+    GitHub Actions 单个 run 最长 6 小时，超过即物理上不可能还活着。本地 runs 表
+    若因 PAT 失效、仓库迁移、对账失败等原因长期停在 queued/running，会永久阻塞
+    persistent rotation 的 Phase 1 守卫（get_latest_active_run），导致 rotation
+    静默停摆。这里做超时兜底，不依赖 GitHub 确认。
+
+    只处理 triggered_at 非空的记录：早期手动建的记录没有时间戳，无法判定年龄。
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
+    finals = (
+        RUN_ORACLE_COMPLETED,
+        RUN_ORACLE_FAILED,
+        RUN_ORACLE_CANCELLED,
+        RUN_ORACLE_PROVISIONING_TIMEOUT,
+    )
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                "UPDATE runs SET status=?, github_status=?, updated_at=? "
+                "WHERE status NOT IN (?,?,?,?) "
+                "  AND triggered_at IS NOT NULL AND triggered_at < ?",
+                (RUN_ORACLE_PROVISIONING_TIMEOUT, "completed", _now(),
+                 *finals, cutoff),
+            )
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+
+def list_runs(limit: int = 100) -> list:
+    with _lock:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT id, run_id, status, github_status, github_conclusion, agent_id, public_ip, private_ip, "
+                "vm_id, vm_name, vm_size, location, template, origin, triggered_at, registered_at, updated_at "
+                "FROM runs ORDER BY triggered_at DESC NULLS LAST, updated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+
+def get_run(run_id: int):
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            if d.get("meta_json"):
+                d["meta"] = json.loads(d["meta_json"])
+            return d
+        finally:
+            conn.close()
+
+
+def find_runs_by_ip(ip: str) -> list:
+    with _lock:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT run_id, status, agent_id, public_ip, private_ip, vm_size, location, template, origin, triggered_at FROM runs "
+                "WHERE public_ip=? OR private_ip=? ORDER BY triggered_at DESC",
+                (ip, ip),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+
+def list_run_ids(limit: int = 200) -> list[int]:
+    with _lock:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT run_id FROM runs ORDER BY updated_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+            return [r["run_id"] for r in rows]
+        finally:
+            conn.close()
+
+
+def get_run_by_vm_id(vm_id: str):
+    """按 Azure VM ID 反查 run：优先最新非终态行，回退最新任意行。"""
+    if not vm_id:
+        return None
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute(
+                "SELECT * FROM runs WHERE vm_id=? AND status NOT IN (?,?,?,?) "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (vm_id, RUN_ORACLE_COMPLETED, RUN_ORACLE_FAILED, RUN_ORACLE_CANCELLED,
+                 RUN_ORACLE_PROVISIONING_TIMEOUT),
+            ).fetchone()
+            if not row:
+                row = conn.execute(
+                    "SELECT * FROM runs WHERE vm_id=? ORDER BY updated_at DESC LIMIT 1",
+                    (vm_id,),
+                ).fetchone()
+        finally:
+            conn.close()
+    if not row:
+        return None
+    d = dict(row)
+    if d.get("meta_json"):
+        d["meta"] = json.loads(d["meta_json"])
+    return d
+
+
+def get_run_by_either(identifier: int):
+    """兼容两种标识：优先 GitHub run_id，其次内部自增 id。"""
+    r = get_run(identifier)
+    if r:
+        return r
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute("SELECT * FROM runs WHERE id=?", (identifier,)).fetchone()
+        finally:
+            conn.close()
+    if not row:
+        return None
+    d = dict(row)
+    if d.get("meta_json"):
+        d["meta"] = json.loads(d["meta_json"])
+    return d
+
+
+def run_state(run_id: int):
+    """给 exec 等用的状态速查（兼容两种标识）。"""
+    r = get_run_by_either(run_id)
+    if not r:
+        return None
+    return {
+        "state": r.get("status"),
+        "agent_id": r.get("agent_id"),
+        "run_id": r.get("run_id"),
+        "internal_id": r.get("id"),
+        "github_status": r.get("github_status"),
+        "github_conclusion": r.get("github_conclusion"),
+    }
+
+# ----------------------------------------------------------------- templates
+
+def upsert_template(name: str, description: str, steps: list, enabled: bool = True) -> dict:
+    """存/更新模板（steps 为已校验的 canonical list）。"""
+    now = _now()
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT id FROM task_templates WHERE name=?", (name,)).fetchone()
+            if row:
+                conn.execute(
+                    "UPDATE task_templates SET description=?, steps=?, enabled=?, updated_at=? WHERE id=?",
+                    (description or "", json.dumps(steps, ensure_ascii=False), int(bool(enabled)), now, row["id"]),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO task_templates (name, description, steps, enabled, created_at, updated_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (name, description or "", json.dumps(steps, ensure_ascii=False), int(bool(enabled)), now, now),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    return get_template(name)
+
+
+def get_template(name: str):
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute("SELECT * FROM task_templates WHERE name=?", (name,)).fetchone()
+        finally:
+            conn.close()
+    if not row:
+        return None
+    d = dict(row)
+    d["steps"] = json.loads(d["steps"] or "[]")
+    d["enabled"] = bool(d["enabled"])
+    return d
+
+
+def list_templates() -> list:
+    with _lock:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT name, description, enabled, created_at, updated_at FROM task_templates ORDER BY name"
+            ).fetchall()
+        finally:
+            conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["enabled"] = bool(d["enabled"])
+        out.append(d)
+    return out
+
+
+def set_template_secret(name: str, key: str, value: str) -> None:
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT id FROM task_templates WHERE name=?", (name,)).fetchone()
+            if not row:
+                conn.rollback()
+                raise KeyError(f"template not found: {name}")
+            conn.execute(
+                "INSERT INTO template_secrets (template_id, key, value) VALUES (?,?,?) "
+                "ON CONFLICT(template_id,key) DO UPDATE SET value=excluded.value",
+                (row["id"], key, value),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_template_secrets(name: str) -> dict:
+    """返回 {key: value}；仅服务端/agentctl 内部使用，严禁进 API/日志。"""
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute("SELECT id FROM task_templates WHERE name=?", (name,)).fetchone()
+            if not row:
+                return {}
+            rows = conn.execute(
+                "SELECT key, value FROM template_secrets WHERE template_id=?", (row["id"],)
+            ).fetchall()
+        finally:
+            conn.close()
+    return {r["key"]: r["value"] for r in rows}
+
+
+def list_template_secret_keys(name: str) -> list:
+    return sorted(get_template_secrets(name).keys())
+
+# ----------------------------------------------------------------- template_runs
+
+def create_template_run(run_id, template: str, agent_id: str) -> int:
+    now = _now()
+    with _lock:
+        conn = _conn()
+        try:
+            cur = conn.execute(
+                "INSERT INTO template_runs (run_id, template, agent_id, status, steps_json, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (run_id, template, agent_id, "running", "[]", now),
+            )
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+
+def finish_template_run(trun_id: int, status: str, failed_step: str = "", steps: list | None = None) -> None:
+    now = _now()
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute(
+                "UPDATE template_runs SET status=?, failed_step=?, steps_json=?, finished_at=? WHERE id=?",
+                (status, failed_step or "", json.dumps(steps or [], ensure_ascii=False), now, trun_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def list_template_runs(limit: int = 50, run_id=None, template: str | None = None) -> list:
+    sql = "SELECT * FROM template_runs"
+    cond, args = [], []
+    if run_id is not None:
+        cond.append("run_id=?"); args.append(run_id)
+    if template:
+        cond.append("template=?"); args.append(template)
+    if cond:
+        sql += " WHERE " + " AND ".join(cond)
+    sql += " ORDER BY id DESC LIMIT ?"; args.append(limit)
+    with _lock:
+        conn = _conn()
+        try:
+            rows = conn.execute(sql, args).fetchall()
+        finally:
+            conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["steps"] = json.loads(d["steps_json"] or "[]")
+        d.pop("steps_json", None)
+        out.append(d)
+    return out
+
+
+def get_latest_active_run(origin: str | None = None, template: str | None = None) -> dict | None:
+    """查询最近一条非终态 run（queued/provisioning/running）。
+
+    用于 persistent rotation 的 Phase 1 判定：
+    "有没有已经触发、但还没结束的 Runner Run？"
+    """
+    with _lock:
+        conn = _conn()
+        try:
+            sql = ("SELECT * FROM runs WHERE status NOT IN "
+                   "('completed', 'failed', 'cancelled', 'provisioning_timeout')")
+            cond, args = [], []
+            if origin:
+                cond.append("origin=?"); args.append(origin)
+            if template:
+                cond.append("template=?"); args.append(template)
+            if cond:
+                sql += " AND " + " AND ".join(cond)
+            sql += " ORDER BY triggered_at DESC NULLS LAST LIMIT 1"
+            row = conn.execute(sql, args).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+
+def get_running_template_run(template: str | None = None):
+    sql = "SELECT * FROM template_runs WHERE status='running'"
+    args = []
+    if template:
+        sql += " AND template=?"
+        args.append(template)
+    sql += " ORDER BY id DESC LIMIT 1"
+    with _lock:
+        conn = _conn()
+        try:
+            row = conn.execute(sql, args).fetchone()
+        finally:
+            conn.close()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["steps"] = json.loads(d["steps_json"] or "[]")
+    except Exception:
+        d["steps"] = []
+    d.pop("steps_json", None)
+    return d
+
+
+def has_running_template_run(template: str) -> bool:
+    return get_running_template_run(template) is not None
+
+
+def get_latest_template_run(run_id=None, template: str | None = None):
+    rows = list_template_runs(limit=1, run_id=run_id, template=template)
+    return rows[0] if rows else None
+
+def rename_template(old_name: str, new_name: str) -> dict:
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            dup = conn.execute("SELECT id FROM task_templates WHERE name=?", (new_name,)).fetchone()
+            if dup:
+                conn.rollback()
+                raise KeyError(f"template already exists: {new_name}")
+            cur = conn.execute("UPDATE task_templates SET name=?, updated_at=? WHERE name=?", (new_name, _now(), old_name))
+            if cur.rowcount == 0:
+                conn.rollback()
+                raise KeyError(f"template not found: {old_name}")
+            conn.commit()
+        finally:
+            conn.close()
+    return get_template(new_name)
+
+
+
+# --------------------------------------------------------------------------- #
+# GitHub-side state machine DB helpers (RUN_LIFECYCLE.md §5)                  #
+# --------------------------------------------------------------------------- #
+
+def insert_provisioning(template: str, nonce: str, now: str) -> int:
+    """Insert a provisioning record (run_id NULL, occupies slot).
+
+    Called BEFORE dispatch to prevent duplicate triggers even if run_id
+    capture fails later.
+    """
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "INSERT INTO runs (run_id, status, github_status, triggered_at, "
+                "updated_at, template, origin) "
+                "VALUES (NULL, ?, 'queued', ?, ?, ?, 'persistent_rotation')",
+                (RUN_ORACLE_PROVISIONING, now, now, template),
+            )
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+
+def update_run_id(row_id: int, run_id: int) -> None:
+    """Fill in run_id after successful dispatch + claim."""
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute(
+                "UPDATE runs SET run_id=?, updated_at=? WHERE id=?",
+                (run_id, _now(), row_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def mark_cancel_intent(run_id: int) -> None:
+    """Record intent to cancel (GitHub cancel is async)."""
+    with _lock:
+        conn = _conn()
+        try:
+            conn.execute(
+                "UPDATE runs SET cancel_intent=1, updated_at=? WHERE run_id=?",
+                (_now(), run_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_active_runs_by_template(template: str) -> list:
+    """Get all non-final runs for a template from local DB."""
+    finals = (RUN_ORACLE_COMPLETED, RUN_ORACLE_FAILED, RUN_ORACLE_CANCELLED,
+              RUN_ORACLE_PROVISIONING_TIMEOUT)
+    with _lock:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM runs WHERE template=? AND status NOT IN (?,?,?,?) "
+                "ORDER BY triggered_at DESC NULLS LAST",
+                (template, *finals),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+
+def get_orphan_runs() -> list:
+    """Get non-final runs with no template assignment."""
+    finals = (RUN_ORACLE_COMPLETED, RUN_ORACLE_FAILED, RUN_ORACLE_CANCELLED,
+              RUN_ORACLE_PROVISIONING_TIMEOUT)
+    with _lock:
+        conn = _conn()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM runs WHERE (template IS NULL OR template='') "
+                "AND status NOT IN (?,?,?,?) "
+                "AND origin='persistent_rotation' "
+                "ORDER BY triggered_at DESC NULLS LAST",
+                (*finals,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+
+def reconcile_run_status(run_id: int, github_status: str, github_conclusion: str | None, now: str) -> str | None:
+    """Sync a single run's status from GitHub facts."""
+    return sync_run_from_github(run_id, github_status, github_conclusion, now)

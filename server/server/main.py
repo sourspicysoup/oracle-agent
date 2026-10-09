@@ -101,7 +101,7 @@ async def access_log_middleware(request: Request, call_next):
     status = 500
     body = None
     # client IP 判定（防伪造）：
-    #  - socket 对端非 loopback（=公网直连 213.35.122.16:8700）：client 必须是对端 IP，
+    #  - socket 对端非 loopback（=公网直连 REDACTED_SERVER_IP:8700）：client 必须是对端 IP，
     #    x-forwarded-for / cf-connecting-ip 可伪造，一律不信
     #  - socket 对端 loopback（=CF 隧道或本机）：仅当 cdn-loop 含 cloudflare 时才信 CF 头
     _sock_host = request.client.host if request.client else None

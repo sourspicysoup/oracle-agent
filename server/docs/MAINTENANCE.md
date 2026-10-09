@@ -75,7 +75,7 @@ oracle-agent.service（FastAPI + SQLite，/opt/oracle-agent）
 | `ROTATION_AGE_MIN` | run 活到多少分钟时触发轮换（默认 `355`，留 5min 余量） |
 | `ROTATION_CHECK_INTERVAL` | 检查间隔秒（默认 `300`） |
 | `AGENT_ONLINE_TIMEOUT` | 等新 agent 上线超时秒（默认 `600`） |
-| `PRUNE_DRY_RUN` | `true`=只打日志不实际 cancel（默认 `true`，观察稳定后改 `false`） |
+| `PRUNE_DRY_RUN` | `true`=只打日志不实际 cancel（默认 `true`，**已于 2026-10-09 改为 `false`**） |
 | `STALE_RUN_MAX_AGE_HOURS` | 僵尸 run 回收阈值小时（默认 `6.5`） |
 
 > ⚠️ 权限：`/etc/default/oracle-agent` 保持 root 600；服务以 `oracle-agent` 用户运行。
@@ -156,8 +156,8 @@ Runner（GitHub Actions bootstrap runner）通过以下端点与 Server 通信�
 ### 4.4 当前账号配置
 
 ```
-主账号:  <REDACTED_USER>  / oracle-agent-bootstrap  (env GH_PAT)
-备用账号: <REDACTED_USER>   / oracle-agent-bootstrap  (accounts.json)
+主账号:  woluren  / oracle-agent-bootstrap  (env GH_PAT)
+备用账号: sirkur   / oracle-agent-bootstrap  (accounts.json)
 ```
 
 ### 4.5 注意事项
@@ -218,7 +218,7 @@ sudo journalctl -u oracle-agent --since '5 min ago' --no-pager -o cat | grep -E 
 
 典型输出：
 ```
-INFO [oracle.persistent] persistent_runner_loop started: templates=['atlas1', 'atlas2'], prune_dry_run=True
+INFO [oracle.persistent] persistent_runner_loop started: templates=['atlas1', 'atlas2'], prune_dry_run=False
 INFO [oracle.persistent] persistent: atlas1 OK — run 37737848303 (status=in_progress, agent=...bbf30434)
 INFO [oracle.persistent] persistent: atlas2 OK — run 37737848313 (status=in_progress, agent=...984f0578)
 INFO [oracle.persistent] persistent: drift fix — run 37731876820 completed on GitHub (conclusion=cancelled), updated local DB
@@ -254,7 +254,7 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/
 
 ## 9. 源码备份（GitHub）
 
-- 目标仓库：**`<REDACTED_GH_REPO>`（private）**，分支 `main`
+- 目标仓库：**`pornnewbee/oracle-agent`（private）**，分支 `main`
 - 备份范围：`server/**`（不含 `data/oracle.db`、`access.log`、`accounts.json`）、`docs/**`
 - 凭据不落库：所有 token 不外推；`server/data/accounts.json` 不入库
 
@@ -355,8 +355,8 @@ for lr in local_active_all:
 当同一模板名下出现多个活跃 run 时，保留最新的一个，cancel 其余。
 无模板归属的 orphan run 也在此清理。
 
-**当前为 dry-run 模式**（`PRUNE_DRY_RUN=true`）：只打 `PRUNE would cancel` 日志，不实际调用 GitHub cancel。
-观察日志确认判断正确后，改 `PRUNE_DRY_RUN=false` 启用真实取消。
+**已启用真实取消**（`PRUNE_DRY_RUN=false`，2026-10-09 起生效）：发现多余 run 时直接调用 GitHub cancel，不再仅打日志。
+此前 dry-run 模式下曾因 DNS 失败导致重复触发 3 个 run/template，prune 只打日志未取消，修复 `gh_list_active_runs` 返回 `None` 后同时启用真实取消，系统已收敛至 1 run/template。
 
 ### 11.6 配置（环境变量）
 
@@ -368,7 +368,7 @@ for lr in local_active_all:
 | `ROTATION_AGE_MIN` | `355` | run 活到多少分钟时触发轮换（5h55min，留 5min 余量） |
 | `ROTATION_CHECK_INTERVAL` | `300` | 检查间隔（秒） |
 | `AGENT_ONLINE_TIMEOUT` | `600` | 等新 agent 上线超时（秒，10min） |
-| `PRUNE_DRY_RUN` | `true` | dry-run 模式，只打日志不 cancel |
+| `PRUNE_DRY_RUN` | `false` | 已启用真实取消（2026-10-09） |
 | `STALE_RUN_MAX_AGE_HOURS` | `6.5` | 僵尸 run 回收阈值（GitHub 6h 硬限 + 0.5h 缓冲） |
 
 ### 11.7 模块结构
@@ -466,4 +466,4 @@ provisioning 状态占用名额，彻底堵死重复触发。
 - DB 明文 token → `{secret:REF}` 化
 - `cf_ip_rotate.py` 接入 L2 token 轮换
 - supervisor 自动排程接通 accounts.json Profile 多账号（当前 gh.py 已多账号，supervisor 尚未启用）
-- PRUNE dry-run 观察稳定后改 `PRUNE_DRY_RUN=false` 启用真实取消
+- PRUNE 已启用真实取消（`PRUNE_DRY_RUN=false`，2026-10-09）

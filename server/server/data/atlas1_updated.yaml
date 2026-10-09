@@ -1,0 +1,149 @@
+name: atlas1
+description: deploy xray(vless) + cloudflared tunnel + shell-mcp + tgbot on a fresh GitHub runner (converted from pornnewbee atlas1 workflow)
+steps:
+- name: Show IP info
+  run:
+  - bash
+  - -c
+  - 'curl ifconfig.io
+
+    echo "runner:runner" | sudo chpasswd
+
+    sudo systemctl start ssh
+
+    '
+  timeout_sec: 120
+  env: {}
+- name: Download and setup Xray
+  run:
+  - bash
+  - -c
+  - 'sudo mkdir -p /var/log/v2ray
+
+    sudo chmod 755 /var/log/v2ray
+
+    curl -L https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o /tmp/Xray.zip
+
+    unzip /tmp/Xray.zip -d /tmp/xray-tmp
+
+    sudo cp /tmp/xray-tmp/xray /usr/local/bin/xray
+
+    sudo chmod +x /usr/local/bin/xray
+
+    sudo mkdir -p /etc/xray
+
+    curl -L https://github.com/pornnewbee/socks5-for-serv00/raw/refs/heads/main/Configs/V2Ray/config.json -o config.json
+
+    sudo mv config.json /etc/xray/
+
+    curl -L https://github.com/pornnewbee/socks5-for-serv00/raw/refs/heads/main/Configs/V2Ray/xray.service -o xray.service
+
+    sudo mv xray.service /etc/systemd/system/
+
+    sudo /usr/local/bin/xray -test -c /etc/xray/config.json
+
+    '
+  timeout_sec: 600
+  env: {}
+- name: Start Xray service
+  run:
+  - bash
+  - -c
+  - 'sudo systemctl daemon-reload
+
+    sudo systemctl enable xray
+
+    sudo systemctl start xray
+
+    sudo systemctl status xray --no-pager
+
+    '
+  timeout_sec: 180
+  env: {}
+- name: Install latest cloudflared (tunnel A via secret)
+  run:
+  - bash
+  - -c
+  - 'curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+
+    chmod +x cloudflared
+
+    sudo mv cloudflared /usr/local/bin/
+
+    cloudflared --version
+
+    # 幂等：先卸掉旧 service（不存在则忽略），再按 secret token 安装 cloudflared.service(业务隧道A)
+
+    sudo cloudflared service uninstall 2>/dev/null || true
+
+    sudo systemctl daemon-reload
+
+    sudo cloudflared service install "$TUNNEL_A_TOKEN"
+
+    curl -L https://github.com/pornnewbee/codespace/raw/refs/heads/main/service/atlas1.service -o atlas.service
+
+    sudo mv atlas.service /etc/systemd/system/
+
+    sudo systemctl daemon-reload
+
+    sudo systemctl enable atlas
+
+    sudo systemctl start atlas
+
+    sudo rm -rf ~/tmp
+
+    '
+  timeout_sec: 600
+  env:
+    TUNNEL_A_TOKEN:
+      secret: cf_tunnel_a
+- name: debug
+  run:
+  - bash
+  - -c
+  - 'python3 -m venv /home/runner/mcp-venv
+
+    /home/runner/mcp-venv/bin/python -m pip install "mcp==2.2.0" uvicorn starlette
+
+    cd ~
+
+    curl -L https://github.com/pornnewbee/socks5-for-serv00/raw/refs/heads/main/Configs/MCP/shell-mcp.service -o shell-mcp.service
+
+    curl -L https://github.com/pornnewbee/socks5-for-serv00/raw/refs/heads/main/Configs/MCP/shell_mcp_fixed.py -o shell_mcp.py
+
+    sudo mv shell-mcp.service /etc/systemd/system/
+
+    curl -L https://raw.githubusercontent.com/pornnewbee/socks5-for-serv00/refs/heads/main/Configs/TGBot/logsender.py -o tgbot.py
+
+    curl -L https://raw.githubusercontent.com/pornnewbee/socks5-for-serv00/refs/heads/main/Configs/TGBot/tgbot.service -o tgbot.service
+
+    sudo mv tgbot.service /etc/systemd/system/
+
+    sudo sed -i "/^ExecStart=/i Environment=BOT_TOKEN=REDACTED_BOT_TOKEN_PLACEHOLDER\nEnvironment=CHAT_IDS=REDACTED_CHAT_ID_PLACEHOLDER" /etc/systemd/system/tgbot.service
+
+    sudo systemctl daemon-reload
+
+    sudo systemctl enable shell-mcp
+
+    sudo systemctl start shell-mcp
+
+    sudo systemctl status shell-mcp --no-pager
+
+    sudo systemctl enable tgbot
+
+    sudo systemctl start tgbot
+
+    sudo systemctl status tgbot --no-pager
+
+    '
+  timeout_sec: 900
+  env: {}
+- name: Install cloudflared biz connector (139d/a143f4bf)
+  run:
+  - bash
+  - -c
+  - "set -e\n# 幂等：若已存在旧的 cloudflared-biz 服务先停掉（兼容重跑）\nif systemctl list-unit-files | grep -q cloudflared-biz.service; then\n  sudo systemctl stop cloudflared-biz 2>/dev/null || true\n  sudo systemctl disable cloudflared-biz 2>/dev/null || true\nfi\ncat > /tmp/cloudflared-biz.service <<'UNITEOF'\n[Unit]\nDescription=Cloudflare Biz Tunnel\nAfter=network.target\n\n[Service]\nTimeoutStartSec=0\nType=notify\nExecStart=/usr/local/bin/cloudflared tunnel run --token __BIZ_TOKEN__\nRestart=on-failure\nRestartSec=5s\n\n[Install]\nWantedBy=multi-user.target\nUNITEOF\n# $BIZ_TOKEN 由模板 secret 经 export 前缀注入本 shell，替换占位符写入 unit\nsed -i \"s|__BIZ_TOKEN__|$BIZ_TOKEN|\" /tmp/cloudflared-biz.service\nsudo mv /tmp/cloudflared-biz.service /etc/systemd/system/cloudflared-biz.service\nsudo systemctl daemon-reload\nsudo systemctl enable cloudflared-biz\nsudo systemctl start cloudflared-biz\nsleep 3\nsudo systemctl is-active cloudflared-biz || { echo \"CLOUDFLARED-BIZ NOT ACTIVE\"; sudo journalctl -u cloudflared-biz -n 40 --no-pager; exit 1; }\n"
+  timeout_sec: 600
+  env:
+    BIZ_TOKEN:
+      secret: cf_tunnel_b

@@ -1,1 +1,1 @@
-{"supervisors":[{"name":"atlas1-runner","repo":"oracle-agent-bootstrap","workflow_file":".github/workflows/bootstrap.yml","accounts":["<REDACTED_ACCOUNT>","<REDACTED_ACCOUNT>"],"min_running":1,"renew_after_sec":21300,"check_interval_sec":60,"enabled":false,"template":"atlas1"}]}
+{"supervisors":[{"name":"atlas1-runner","repo":"oracle-agent-bootstrap","workflow_file":".github/workflows/bootstrap.yml","accounts":["woluren-primary","sirkur-backup"],"min_running":1,"renew_after_sec":21300,"check_interval_sec":60,"enabled":false,"template":"atlas1"}]}

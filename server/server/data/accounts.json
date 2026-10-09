@@ -1,0 +1,16 @@
+{
+  "profiles": [
+    {
+      "name": "wollcre-primary",
+      "owner": "wollcre",
+      "repo": "oracle-agent-bootstrap",
+      "pat": "ghp_REDACTED_PAT_PLACEHOLDER_1"
+    },
+    {
+      "name": "sirkur-backup",
+      "owner": "sirkur",
+      "repo": "oracle-agent-bootstrap",
+      "pat": "ghp_REDACTED_PAT_PLACEHOLDER_2"
+    }
+  ]
+}

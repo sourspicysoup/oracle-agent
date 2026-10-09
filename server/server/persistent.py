@@ -76,8 +76,13 @@ def _reconcile_with_github(template: str) -> list[dict]:
     try:
         all_active = gh_mod.gh_list_active_runs(per_page=30)
     except Exception as e:
-        log.warning("persistent: gh_list_active_runs failed: %s", e)
-        return []
+        log.warning("persistent: gh_list_active_runs raised: %s", e)
+        return None  # query failed, skip this cycle entirely
+
+    # gh_list_active_runs returns None when ALL accounts failed (DNS/network)
+    if all_active is None:
+        log.warning("persistent: gh_list_active_runs returned None (all accounts failed), skip %s", template)
+        return None  # signal "unavailable" to _do_rotate
 
     now = _now_iso()
 
@@ -270,6 +275,11 @@ def _do_rotate(template_name: str):
 
     # 1. Reconcile with GitHub — get active runs owned by this template
     active = _reconcile_with_github(template_name)
+
+    # If GitHub query failed entirely, skip this cycle — don't trigger
+    if active is None:
+        log.warning("persistent: %s reconcile unavailable (GitHub query failed), skip", template_name)
+        return
 
     # 2. PRUNE: if more than 1 active run for this template, cancel excess
     if len(active) > 1:

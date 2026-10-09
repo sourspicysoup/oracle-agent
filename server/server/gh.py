@@ -276,16 +276,21 @@ def ensure_all_bootstrap_repos(private=False) -> dict:
 # GitHub-side state machine helpers (RUN_LIFECYCLE.md §2-§5)                  #
 # --------------------------------------------------------------------------- #
 
-def gh_list_active_runs(per_page: int = 30) -> list[dict]:
+def gh_list_active_runs(per_page: int = 30) -> list[dict] | None:
     """List runs with status != 'completed' (queued + in_progress).
 
     GitHub API's status param doesn't support multi-value, so we fetch without
     status filter and filter locally. One request covers both states.
+
+    Returns None when ALL accounts fail (network/DNS error) to distinguish
+    from a successful query that simply has no active runs ([]).
     """
     runs = []
+    all_failed = True
     for pat, owner, repo in get_accounts():
         try:
             data = gh_request("GET", f"/repos/{owner}/{repo}/actions/runs?per_page={per_page}")
+            all_failed = False
             for r in data.get("workflow_runs", []):
                 if r.get("status") != "completed":
                     r["_owner"] = owner
@@ -295,6 +300,9 @@ def gh_list_active_runs(per_page: int = 30) -> list[dict]:
         except Exception as e:
             log.warning("gh_list_active_runs: %s/%s failed: %s", owner, repo, e)
             continue
+    if all_failed:
+        log.warning("gh_list_active_runs: all accounts failed, returning None")
+        return None
     return runs
 
 
@@ -369,100 +377,3 @@ def gh_dispatch_workflow(template: str, nonce: str, ref: str = "main") -> bool:
             continue
     return False
 
-
-# --------------------------------------------------------------------------- #
-# GitHub-side state machine helpers (RUN_LIFECYCLE.md §2-§5)                  #
-# --------------------------------------------------------------------------- #
-
-def gh_list_active_runs(per_page: int = 30) -> list[dict]:
-    """List runs with status != 'completed' (queued + in_progress).
-
-    GitHub API's status param doesn't support multi-value, so we fetch without
-    status filter and filter locally. One request covers both states.
-    """
-    runs = []
-    for pat, owner, repo in get_accounts():
-        try:
-            data = gh_request("GET", f"/repos/{owner}/{repo}/actions/runs?per_page={per_page}")
-            for r in data.get("workflow_runs", []):
-                if r.get("status") != "completed":
-                    r["_owner"] = owner
-                    r["_repo"] = repo
-                    r["_pat"] = pat
-                    runs.append(r)
-        except Exception as e:
-            log.warning("gh_list_active_runs: %s/%s failed: %s", owner, repo, e)
-            continue
-    return runs
-
-
-def gh_find_run_by_nonce(nonce: str, template: str, per_page: int = 10) -> dict | None:
-    """Find a run whose display_title contains the nonce.
-
-    bootstrap.yml uses run-name: "${{ inputs.template }}-${{ inputs.nonce }}"
-    so display_title will be like "atlas1-abc123".
-    """
-    for pat, owner, repo in get_accounts():
-        try:
-            data = gh_request("GET", f"/repos/{owner}/{repo}/actions/runs?per_page={per_page}")
-            for r in data.get("workflow_runs", []):
-                title = r.get("display_title") or r.get("name") or ""
-                if nonce in title:
-                    r["_owner"] = owner
-                    r["_repo"] = repo
-                    r["_pat"] = pat
-                    return r
-        except Exception as e:
-            log.warning("gh_find_run_by_nonce: %s/%s failed: %s", owner, repo, e)
-            continue
-    return None
-
-
-def gh_get_run(run_id: int) -> dict | None:
-    """Get single run details across all accounts."""
-    for pat, owner, repo in get_accounts():
-        try:
-            data = gh_request("GET", f"/repos/{owner}/{repo}/actions/runs/{run_id}")
-            if data:
-                data["_owner"] = owner
-                data["_repo"] = repo
-                data["_pat"] = pat
-                return data
-        except Exception as e:
-            if "404" not in str(e):
-                log.warning("gh_get_run: %s/%s failed: %s", owner, repo, e)
-            continue
-    return None
-
-
-def gh_cancel_run(run_id: int) -> bool:
-    """Cancel a GitHub Actions run. Returns True on success."""
-    for pat, owner, repo in get_accounts():
-        try:
-            gh_request("POST", f"/repos/{owner}/{repo}/actions/runs/{run_id}/cancel")
-            log.info("gh_cancel_run: cancelled %d on %s/%s", run_id, owner, repo)
-            return True
-        except Exception as e:
-            if "404" in str(e) or "409" in str(e):
-                continue
-            log.warning("gh_cancel_run: %s/%s failed: %s", owner, repo, e)
-            continue
-    return False
-
-
-def gh_dispatch_workflow(template: str, nonce: str, ref: str = "main") -> bool:
-    """Dispatch bootstrap workflow with template + nonce inputs."""
-    for pat, owner, repo in get_accounts():
-        try:
-            gh_request(
-                "POST",
-                f"/repos/{owner}/{repo}/actions/workflows/bootstrap.yml/dispatches",
-                data={"ref": ref, "inputs": {"template": template, "nonce": nonce}},
-            )
-            log.info("gh_dispatch_workflow: dispatched on %s/%s (template=%s nonce=%s)",
-                     owner, repo, template, nonce)
-            return True
-        except Exception as e:
-            log.warning("gh_dispatch_workflow: %s/%s failed: %s", owner, repo, e)
-            continue
-    return False

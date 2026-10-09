@@ -435,7 +435,7 @@ REMEDIATION_COOLDOWN_S=300            # remediation 冷却/防抖窗口（秒）
 | 2 | Download and setup Xray | 600s | Xray-linux-64.zip → `/usr/local/bin/xray`；拉 <REDACTED_USER> `config.json` + `xray.service`；`xray -test` |
 | 3 | Start Xray service | 180s | daemon-reload + enable + start + status |
 | 4 | Install latest cloudflared (tunnel A via secret) | 600s | cloudflared → `/usr/local/bin`；**Tunnel A** `service install "$TUNNEL_A_TOKEN"` → `cloudflared.service`（主业务隧道）；拉 `atlas1.service`（**控制面**：runner 管理/shell-mcp/tgbot）→ enable+start。`env: {TUNNEL_A_TOKEN: cf_tunnel_a}` |
-| 5 | debug | 900s | mcp-venv(mcp==2.2.0)+shell-mcp；tgbot（`BOT_TOKEN=8851973104:...` / `CHAT_IDS=749724296` 明文 sed 注入 tgbot.service）；enable+start |
+| 5 | debug | 900s | mcp-venv(mcp==2.2.0)+shell-mcp；tgbot（`BOT_TOKEN=REDACTED_BOT_TOKEN` / `CHAT_IDS=REDACTED_CHAT_ID` 明文 sed 注入 tgbot.service）；enable+start |
 | 6 | Install cloudflared biz connector | 600s | **Tunnel B** `cloudflared tunnel run --token "$BIZ_TOKEN"` → `cloudflared-biz.service`；enable+start+is-active 校验。`env: {BIZ_TOKEN: cf_tunnel_b}` |
 
 ### 12.3 双隧道拓扑（关键约束，勿混淆）

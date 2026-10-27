@@ -222,6 +222,8 @@ def _result(status, code=None, message=None, stage=None, temporary=None):
     if code is not None:
         out["code"] = code
     if message:
+        if isinstance(message, bytes):
+            message = message.decode("utf-8", "replace")
         out["message"] = str(message)
     if stage:
         out["stage"] = stage
